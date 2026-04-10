@@ -1,1 +1,6 @@
+#!/usr/bin/env sh
+
+# Ensure bun is on PATH (Kiro/IDE shells may not inherit user PATH)
+export PATH="$HOME/.bun/bin:$HOME/.npm/_npx/5c4f1b4a21be27f7/node_modules/@oven/bun-linux-x64-baseline/bin:$PATH"
+
 bun x lint-staged
