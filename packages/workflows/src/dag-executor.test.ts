@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, mock, type Mock } from 'bun:test';
+import fc from 'fast-check';
 import { mkdir, writeFile, rm } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
@@ -131,7 +132,7 @@ function createMockPlatform(): IWorkflowPlatform {
 
 const minimalConfig: WorkflowConfig = {
   assistant: 'claude',
-  assistants: { claude: {}, codex: {} },
+  assistants: { claude: {}, codex: {}, opencode: {} },
   commands: {},
   defaults: { loadDefaultCommands: false, loadDefaultWorkflows: false },
 };
@@ -4821,5 +4822,349 @@ describe('executeDagWorkflow -- cost tracking', () => {
     ).mock.calls;
     expect(completeCalls.length).toBe(1);
     expect(completeCalls[0][1]).toMatchObject({ total_cost_usd: 0.004 });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// opencode provider — DAG executor behavior
+// ---------------------------------------------------------------------------
+
+describe('executeDagWorkflow -- opencode provider', () => {
+  let testDir: string;
+
+  beforeEach(async () => {
+    testDir = join(
+      tmpdir(),
+      `dag-opencode-test-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    );
+    const commandsDir = join(testDir, '.archon', 'commands');
+    await mkdir(commandsDir, { recursive: true });
+    await writeFile(join(commandsDir, 'my-cmd.md'), 'My command prompt for $USER_MESSAGE');
+
+    mockSendQueryDag.mockClear();
+    mockGetAssistantClientDag.mockClear();
+
+    mockSendQueryDag.mockImplementation(function* () {
+      yield { type: 'assistant', content: 'DAG AI response' };
+      yield { type: 'result', sessionId: 'dag-session-id' };
+    });
+  });
+
+  afterEach(async () => {
+    // Restore default claude client
+    mockGetAssistantClientDag.mockImplementation(() => ({
+      sendQuery: mockSendQueryDag,
+      getType: () => 'claude',
+    }));
+    try {
+      await rm(testDir, { recursive: true, force: true });
+    } catch {
+      // ignore cleanup errors
+    }
+  });
+
+  it('node with provider: opencode uses opencode client', async () => {
+    mockGetAssistantClientDag.mockImplementation((provider: string) => ({
+      sendQuery: mockSendQueryDag,
+      getType: () => provider,
+    }));
+
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-dag',
+      testDir,
+      {
+        name: 'dag-opencode-node',
+        nodes: [{ id: 'step1', command: 'my-cmd', provider: 'opencode' }],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    // The factory should have been called with 'opencode'
+    expect(mockGetAssistantClientDag).toHaveBeenCalledWith('opencode');
+    expect(mockSendQueryDag.mock.calls.length).toBeGreaterThan(0);
+  });
+
+  it('workflow-level provider: opencode propagates to nodes without explicit provider', async () => {
+    mockGetAssistantClientDag.mockImplementation((provider: string) => ({
+      sendQuery: mockSendQueryDag,
+      getType: () => provider,
+    }));
+
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-dag',
+      testDir,
+      {
+        name: 'dag-opencode-workflow',
+        nodes: [{ id: 'step1', command: 'my-cmd' }],
+      },
+      workflowRun,
+      'opencode',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      { ...minimalConfig, assistant: 'opencode' }
+    );
+
+    // Node without explicit provider should inherit workflow-level opencode
+    expect(mockGetAssistantClientDag).toHaveBeenCalledWith('opencode');
+    expect(mockSendQueryDag.mock.calls.length).toBeGreaterThan(0);
+  });
+
+  it('warns user when opencode node has Claude-only options (effort)', async () => {
+    mockGetAssistantClientDag.mockImplementation(() => ({
+      sendQuery: mockSendQueryDag,
+      getType: () => 'opencode',
+    }));
+
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-dag',
+      testDir,
+      {
+        name: 'opencode-claude-opts-test',
+        nodes: [{ id: 'step1', command: 'my-cmd', provider: 'opencode', effort: 'high' }],
+      },
+      workflowRun,
+      'opencode',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      { ...minimalConfig, assistant: 'opencode' }
+    );
+
+    const sendMessage = platform.sendMessage as ReturnType<typeof mock>;
+    const messages = sendMessage.mock.calls.map((call: unknown[]) => call[1] as string);
+    const warning = messages.find(
+      m => m.includes('effort') && m.toLowerCase().includes('opencode')
+    );
+    expect(warning).toBeDefined();
+  });
+
+  it('warns user when opencode node has allowed_tools', async () => {
+    mockGetAssistantClientDag.mockReturnValue({
+      sendQuery: mockSendQueryDag,
+      getType: () => 'opencode',
+    });
+
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-dag',
+      testDir,
+      {
+        name: 'dag-opencode-allowed-tools',
+        nodes: [
+          {
+            id: 'review',
+            command: 'my-cmd',
+            provider: 'opencode',
+            allowed_tools: ['Read', 'Grep'],
+          },
+        ],
+      },
+      workflowRun,
+      'opencode',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      { ...minimalConfig, assistant: 'opencode' }
+    );
+
+    const sendMessage = platform.sendMessage as ReturnType<typeof mock>;
+    const messages = sendMessage.mock.calls.map((call: unknown[]) => call[1] as string);
+    const warning = messages.find(
+      m => m.includes('allowed_tools') && m.toLowerCase().includes('opencode')
+    );
+    expect(warning).toBeDefined();
+  });
+
+  it('warns user when opencode node has denied_tools', async () => {
+    mockGetAssistantClientDag.mockReturnValue({
+      sendQuery: mockSendQueryDag,
+      getType: () => 'opencode',
+    });
+
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-dag',
+      testDir,
+      {
+        name: 'dag-opencode-denied-tools',
+        nodes: [
+          {
+            id: 'review',
+            command: 'my-cmd',
+            provider: 'opencode',
+            denied_tools: ['WebSearch'],
+          },
+        ],
+      },
+      workflowRun,
+      'opencode',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      { ...minimalConfig, assistant: 'opencode' }
+    );
+
+    const sendMessage = platform.sendMessage as ReturnType<typeof mock>;
+    const messages = sendMessage.mock.calls.map((call: unknown[]) => call[1] as string);
+    const warning = messages.find(
+      m => m.includes('denied_tools') && m.toLowerCase().includes('opencode')
+    );
+    expect(warning).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Property 6: DAG executor option building from config
+// ---------------------------------------------------------------------------
+
+describe('executeDagWorkflow -- opencode option building property test', () => {
+  /**
+   * **Validates: Requirements 6.3**
+   *
+   * Property 6: DAG executor option building from config
+   *
+   * For any valid WorkflowConfig with a non-empty assistants.opencode.model,
+   * when resolving a node with provider: 'opencode' and no node-level model
+   * override, the returned options.model equals config.assistants.opencode.model.
+   */
+
+  let testDir: string;
+
+  beforeEach(async () => {
+    testDir = join(
+      tmpdir(),
+      `dag-opencode-prop6-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    );
+    const commandsDir = join(testDir, '.archon', 'commands');
+    await mkdir(commandsDir, { recursive: true });
+    await writeFile(join(commandsDir, 'my-cmd.md'), 'My command prompt for $USER_MESSAGE');
+
+    mockSendQueryDag.mockClear();
+    mockGetAssistantClientDag.mockClear();
+
+    mockSendQueryDag.mockImplementation(function* () {
+      yield { type: 'assistant', content: 'DAG AI response' };
+      yield { type: 'result', sessionId: 'dag-session-id' };
+    });
+  });
+
+  afterEach(async () => {
+    mockGetAssistantClientDag.mockImplementation(() => ({
+      sendQuery: mockSendQueryDag,
+      getType: () => 'claude',
+    }));
+    try {
+      await rm(testDir, { recursive: true, force: true });
+    } catch {
+      // ignore cleanup errors
+    }
+  });
+
+  /** Arbitrary non-empty model string (no Claude aliases, since opencode rejects those) */
+  const nonClaudeModelArb = fc
+    .string({ minLength: 1, maxLength: 100 })
+    .filter(s => !['sonnet', 'opus', 'haiku', 'inherit'].includes(s) && !s.startsWith('claude-'));
+
+  it('options.model equals config.assistants.opencode.model for any non-empty model', async () => {
+    await fc.assert(
+      fc.asyncProperty(nonClaudeModelArb, async modelStr => {
+        mockSendQueryDag.mockClear();
+        mockGetAssistantClientDag.mockClear();
+
+        mockSendQueryDag.mockImplementation(function* () {
+          yield { type: 'assistant', content: 'DAG AI response' };
+          yield { type: 'result', sessionId: 'dag-session-id' };
+        });
+
+        mockGetAssistantClientDag.mockImplementation(() => ({
+          sendQuery: mockSendQueryDag,
+          getType: () => 'opencode',
+        }));
+
+        const config: WorkflowConfig = {
+          assistant: 'claude',
+          assistants: { claude: {}, codex: {}, opencode: { model: modelStr } },
+          commands: {},
+          defaults: { loadDefaultCommands: false, loadDefaultWorkflows: false },
+        };
+
+        const mockDeps = createMockDeps();
+        const platform = createMockPlatform();
+        const workflowRun = makeWorkflowRun();
+
+        // Use 'claude' as workflow-level provider so the node's explicit
+        // provider: 'opencode' triggers the config.assistants[provider].model
+        // fallback path in resolveNodeProviderAndModel().
+        await executeDagWorkflow(
+          mockDeps,
+          platform,
+          'conv-dag',
+          testDir,
+          {
+            name: 'dag-opencode-prop6',
+            nodes: [{ id: 'step1', command: 'my-cmd', provider: 'opencode' }],
+          },
+          workflowRun,
+          'claude',
+          undefined,
+          join(testDir, 'artifacts'),
+          join(testDir, 'logs'),
+          'main',
+          'docs/',
+          config
+        );
+
+        // sendQuery is called with (prompt, cwd, resumeSessionId, options)
+        expect(mockSendQueryDag.mock.calls.length).toBeGreaterThan(0);
+        const optionsArg = mockSendQueryDag.mock.calls[0][3] as { model?: string } | undefined;
+        expect(optionsArg).toBeDefined();
+        expect(optionsArg!.model).toBe(modelStr);
+      }),
+      { numRuns: 100 }
+    );
   });
 });

@@ -1,4 +1,5 @@
 import { describe, test, expect, beforeEach, afterEach, mock } from 'bun:test';
+import fc from 'fast-check';
 import { homedir } from 'os';
 import { join } from 'path';
 import { createMockLogger } from '../test/mocks/logger';
@@ -224,7 +225,7 @@ concurrency:
       const config = await loadConfig();
 
       expect(config.assistant).toBe('claude');
-      expect(config.assistants).toEqual({ claude: {}, codex: {} });
+      expect(config.assistants).toEqual({ claude: {}, codex: {}, opencode: {} });
       expect(config.streaming.telegram).toBe('stream');
       expect(config.concurrency.maxConversations).toBe(10);
     });
@@ -609,6 +610,231 @@ assistants:
       expect(safe.assistants.claude).toBeDefined();
       expect(safe.assistants.codex).toBeDefined();
       expect(safe.assistants.codex).not.toHaveProperty('additionalDirectories');
+    });
+  });
+
+  describe('opencode config support', () => {
+    test('getDefaults() includes assistants.opencode', async () => {
+      const error = new Error('ENOENT') as NodeJS.ErrnoException;
+      error.code = 'ENOENT';
+      mockReadConfigFile.mockRejectedValue(error);
+
+      const config = await loadConfig();
+      expect(config.assistants.opencode).toBeDefined();
+      expect(config.assistants.opencode).toEqual({});
+    });
+
+    test('global config merge with assistants.opencode.model', async () => {
+      mockReadConfigFile.mockResolvedValue(`
+assistants:
+  opencode:
+    model: anthropic/claude-sonnet-4-20250514
+`);
+
+      const config = await loadConfig();
+      expect(config.assistants.opencode.model).toBe('anthropic/claude-sonnet-4-20250514');
+    });
+
+    test('global config merge preserves claude and codex when setting opencode', async () => {
+      mockReadConfigFile.mockResolvedValue(`
+assistants:
+  claude:
+    model: sonnet
+  codex:
+    model: gpt-5.3-codex
+  opencode:
+    model: anthropic/claude-sonnet-4-20250514
+`);
+
+      const config = await loadConfig();
+      expect(config.assistants.claude.model).toBe('sonnet');
+      expect(config.assistants.codex.model).toBe('gpt-5.3-codex');
+      expect(config.assistants.opencode.model).toBe('anthropic/claude-sonnet-4-20250514');
+    });
+
+    test('repo config merge with assistants.opencode', async () => {
+      const pathMatches = (path: string, pattern: string): boolean => {
+        const normalizedPath = path.replace(/\\/g, '/');
+        return normalizedPath.includes(pattern);
+      };
+
+      let globalConfigRead = false;
+      mockReadConfigFile.mockImplementation(async (path: string) => {
+        if (pathMatches(path, '/repo/.archon/config.yaml')) {
+          return `assistants:\n  opencode:\n    model: openai/gpt-4o\n`;
+        }
+        if (pathMatches(path, '.archon/config.yaml') && !globalConfigRead) {
+          globalConfigRead = true;
+          return `assistants:\n  opencode:\n    model: anthropic/claude-sonnet-4-20250514\n`;
+        }
+        const error = new Error('ENOENT') as NodeJS.ErrnoException;
+        error.code = 'ENOENT';
+        throw error;
+      });
+
+      const config = await loadConfig('/test/repo');
+      expect(config.assistants.opencode.model).toBe('openai/gpt-4o');
+    });
+
+    test('repo config merge preserves claude and codex when setting opencode', async () => {
+      const pathMatches = (path: string, pattern: string): boolean => {
+        const normalizedPath = path.replace(/\\/g, '/');
+        return normalizedPath.includes(pattern);
+      };
+
+      let globalConfigRead = false;
+      mockReadConfigFile.mockImplementation(async (path: string) => {
+        if (pathMatches(path, '/repo/.archon/config.yaml')) {
+          return `assistants:\n  opencode:\n    model: openai/gpt-4o\n`;
+        }
+        if (pathMatches(path, '.archon/config.yaml') && !globalConfigRead) {
+          globalConfigRead = true;
+          return `assistants:\n  claude:\n    model: sonnet\n  codex:\n    model: gpt-5.3-codex\n`;
+        }
+        const error = new Error('ENOENT') as NodeJS.ErrnoException;
+        error.code = 'ENOENT';
+        throw error;
+      });
+
+      const config = await loadConfig('/test/repo');
+      expect(config.assistants.claude.model).toBe('sonnet');
+      expect(config.assistants.codex.model).toBe('gpt-5.3-codex');
+      expect(config.assistants.opencode.model).toBe('openai/gpt-4o');
+    });
+
+    test('DEFAULT_AI_ASSISTANT=opencode env override', async () => {
+      const error = new Error('ENOENT') as NodeJS.ErrnoException;
+      error.code = 'ENOENT';
+      mockReadConfigFile.mockRejectedValue(error);
+
+      process.env.DEFAULT_AI_ASSISTANT = 'opencode';
+
+      const config = await loadConfig();
+      expect(config.assistant).toBe('opencode');
+    });
+
+    test('defaultAssistant: opencode in global config', async () => {
+      mockReadConfigFile.mockResolvedValue('defaultAssistant: opencode');
+
+      const config = await loadConfig();
+      expect(config.assistant).toBe('opencode');
+    });
+
+    test('toSafeConfig() includes opencode section', async () => {
+      mockReadConfigFile.mockResolvedValue(`
+assistants:
+  opencode:
+    model: anthropic/claude-sonnet-4-20250514
+`);
+
+      const config = await loadConfig();
+      const safe = toSafeConfig(config);
+      expect(safe.assistants.opencode).toBeDefined();
+      expect(safe.assistants.opencode.model).toBe('anthropic/claude-sonnet-4-20250514');
+    });
+
+    test('toSafeConfig() includes opencode with undefined model when not configured', async () => {
+      mockReadConfigFile.mockResolvedValue('');
+
+      const config = await loadConfig();
+      const safe = toSafeConfig(config);
+      expect(safe.assistants.opencode).toBeDefined();
+      expect(safe.assistants.opencode.model).toBeUndefined();
+    });
+  });
+
+  describe('opencode config property tests', () => {
+    /**
+     * **Validates: Requirements 4.1, 4.2**
+     *
+     * Property 4: Config merge preserves opencode values
+     *
+     * For any valid opencode config section with a random non-empty model string,
+     * merging via mergeGlobalConfig() or mergeRepoConfig() (tested indirectly
+     * through loadConfig()) produces a MergedConfig where
+     * assistants.opencode.model equals the input. The merge does not alter
+     * assistants.claude or assistants.codex.
+     */
+    /**
+     * Generate a YAML-safe model string by using JSON-style double-quoting
+     * in the YAML template. This lets us test arbitrary non-empty strings
+     * (including YAML-special chars like {, !, :, #) without breaking parsing.
+     */
+    const yamlSafeModelArb = fc.string({ minLength: 1 }).filter(s => s.trim().length > 0);
+
+    test('global config merge preserves arbitrary opencode model string', async () => {
+      await fc.assert(
+        fc.asyncProperty(yamlSafeModelArb, async modelStr => {
+          clearConfigCache();
+          mockReadConfigFile.mockReset();
+
+          // JSON.stringify produces a valid YAML double-quoted scalar
+          const quoted = JSON.stringify(modelStr);
+          const yamlContent = [
+            'assistants:',
+            '  claude:',
+            '    model: fixed-claude-model',
+            '  codex:',
+            '    model: fixed-codex-model',
+            '  opencode:',
+            `    model: ${quoted}`,
+          ].join('\n');
+          mockReadConfigFile.mockResolvedValue(yamlContent);
+
+          const config = await loadConfig();
+
+          // opencode model must equal the input
+          expect(config.assistants.opencode.model).toBe(modelStr);
+          // claude and codex must not be altered
+          expect(config.assistants.claude.model).toBe('fixed-claude-model');
+          expect(config.assistants.codex.model).toBe('fixed-codex-model');
+        }),
+        { numRuns: 100 }
+      );
+    });
+
+    test('repo config merge preserves arbitrary opencode model string', async () => {
+      const pathMatches = (path: string, pattern: string): boolean => {
+        const normalizedPath = path.replace(/\\/g, '/');
+        return normalizedPath.includes(pattern);
+      };
+
+      await fc.assert(
+        fc.asyncProperty(yamlSafeModelArb, async modelStr => {
+          clearConfigCache();
+          mockReadConfigFile.mockReset();
+
+          const quoted = JSON.stringify(modelStr);
+          let globalConfigRead = false;
+          mockReadConfigFile.mockImplementation(async (path: string) => {
+            if (pathMatches(path, '/repo/.archon/config.yaml')) {
+              return ['assistants:', '  opencode:', `    model: ${quoted}`].join('\n');
+            }
+            if (pathMatches(path, '.archon/config.yaml') && !globalConfigRead) {
+              globalConfigRead = true;
+              return [
+                'assistants:',
+                '  claude:',
+                '    model: fixed-claude-model',
+                '  codex:',
+                '    model: fixed-codex-model',
+              ].join('\n');
+            }
+            const error = new Error('ENOENT') as NodeJS.ErrnoException;
+            error.code = 'ENOENT';
+            throw error;
+          });
+
+          const config = await loadConfig('/test/repo');
+
+          // opencode model must equal the input
+          expect(config.assistants.opencode.model).toBe(modelStr);
+          // claude and codex must not be altered
+          expect(config.assistants.claude.model).toBe('fixed-claude-model');
+          expect(config.assistants.codex.model).toBe('fixed-codex-model');
+        }),
+        { numRuns: 100 }
+      );
     });
   });
 });

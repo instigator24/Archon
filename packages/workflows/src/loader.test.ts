@@ -29,6 +29,7 @@ mock.module('@archon/paths', () => ({
 }));
 
 import { discoverWorkflows } from './workflow-discovery';
+import { parseWorkflow } from './loader';
 import { isBashNode, isCancelNode, isLoopNode } from './schemas';
 import * as bundledDefaults from './defaults/bundled-defaults';
 
@@ -2024,6 +2025,64 @@ nodes:
       expect(result.errors).toHaveLength(0);
       // AI fields should produce a warning log
       expect(mockLogger.warn).toHaveBeenCalled();
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // opencode provider parsing
+  // -------------------------------------------------------------------------
+  describe('opencode provider parsing', () => {
+    it('should parse workflow YAML with provider: opencode at top level', () => {
+      const yaml = `
+name: opencode-workflow
+description: Workflow using opencode provider
+provider: opencode
+nodes:
+  - id: analyze
+    prompt: "Analyze the codebase"
+`;
+      const result = parseWorkflow(yaml, 'opencode.yaml');
+      expect(result.error).toBeNull();
+      expect(result.workflow).not.toBeNull();
+      expect(result.workflow!.provider).toBe('opencode');
+      expect(result.workflow!.nodes).toHaveLength(1);
+      expect(result.workflow!.nodes[0].id).toBe('analyze');
+    });
+
+    it('should parse DAG node with provider: opencode', () => {
+      const yaml = `
+name: mixed-providers
+description: Workflow with per-node opencode provider
+nodes:
+  - id: plan
+    command: plan
+  - id: implement
+    prompt: "Implement the plan"
+    provider: opencode
+    depends_on: [plan]
+`;
+      const result = parseWorkflow(yaml, 'mixed.yaml');
+      expect(result.error).toBeNull();
+      expect(result.workflow).not.toBeNull();
+      const wf = result.workflow!;
+      expect(wf.nodes).toHaveLength(2);
+      expect(wf.nodes[1].provider).toBe('opencode');
+    });
+
+    it('should reject provider: opencode with Claude model alias', () => {
+      const yaml = `
+name: invalid-opencode
+description: opencode with Claude model
+provider: opencode
+model: sonnet
+nodes:
+  - id: test
+    command: test
+`;
+      const result = parseWorkflow(yaml, 'invalid-opencode.yaml');
+      expect(result.error).not.toBeNull();
+      expect(result.error!.errorType).toBe('validation_error');
+      expect(result.error!.error).toContain('not compatible');
     });
   });
 });

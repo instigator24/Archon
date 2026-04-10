@@ -352,7 +352,7 @@ function expandEnvVars(config: Record<string, unknown>): {
  */
 async function resolveNodeProviderAndModel(
   node: DagNode,
-  workflowProvider: 'claude' | 'codex',
+  workflowProvider: 'claude' | 'codex' | 'opencode',
   workflowModel: string | undefined,
   config: WorkflowConfig,
   platform: IWorkflowPlatform,
@@ -361,11 +361,11 @@ async function resolveNodeProviderAndModel(
   cwd: string,
   workflowLevelOptions: WorkflowLevelOptions
 ): Promise<{
-  provider: 'claude' | 'codex';
+  provider: 'claude' | 'codex' | 'opencode';
   model: string | undefined;
   options: WorkflowAssistantOptions | undefined;
 }> {
-  let provider: 'claude' | 'codex';
+  let provider: 'claude' | 'codex' | 'opencode';
 
   if (node.provider) {
     provider = node.provider;
@@ -387,30 +387,41 @@ async function resolveNodeProviderAndModel(
     );
   }
 
-  // Warn if Codex node has allowed_tools or denied_tools (unsupported per-call)
+  // Warn if Codex/opencode node has allowed_tools or denied_tools (unsupported per-call)
   if (
-    provider === 'codex' &&
+    (provider === 'codex' || provider === 'opencode') &&
     (node.allowed_tools !== undefined || node.denied_tools !== undefined)
   ) {
-    getLog().warn({ nodeId: node.id }, 'dag_node_tool_restrictions_ignored_codex');
+    const logTag =
+      provider === 'codex'
+        ? 'dag_node_tool_restrictions_ignored_codex'
+        : 'dag_node_tool_restrictions_ignored_opencode';
+    getLog().warn({ nodeId: node.id }, logTag);
+    const providerLabel = provider === 'codex' ? 'Codex' : 'opencode';
     const delivered = await safeSendMessage(
       platform,
       conversationId,
-      `Warning: Node '${node.id}' has allowed_tools/denied_tools set but uses Codex — per-node tool restrictions are not supported for Codex. Configure MCP servers globally in the Codex CLI config instead.`,
+      `Warning: Node '${node.id}' has allowed_tools/denied_tools set but uses ${providerLabel} — per-node tool restrictions are not supported for ${providerLabel}.${provider === 'codex' ? ' Configure MCP servers globally in the Codex CLI config instead.' : ''}`,
       { workflowId: workflowRunId, nodeName: node.id }
     );
     if (!delivered) {
-      getLog().error({ nodeId: node.id, workflowRunId }, 'dag_node_codex_warning_delivery_failed');
+      getLog().error(
+        { nodeId: node.id, workflowRunId },
+        `dag_node_${provider}_warning_delivery_failed`
+      );
     }
   }
 
-  // Warn if Codex node has hooks (unsupported)
-  if (provider === 'codex' && node.hooks) {
-    getLog().warn({ nodeId: node.id }, 'dag_node_hooks_ignored_codex');
+  // Warn if Codex/opencode node has hooks (unsupported)
+  if ((provider === 'codex' || provider === 'opencode') && node.hooks) {
+    const logTag =
+      provider === 'codex' ? 'dag_node_hooks_ignored_codex' : 'dag_node_hooks_ignored_opencode';
+    getLog().warn({ nodeId: node.id }, logTag);
+    const providerLabel = provider === 'codex' ? 'Codex' : 'opencode';
     const delivered = await safeSendMessage(
       platform,
       conversationId,
-      `Warning: Node '${node.id}' has hooks set but uses Codex provider — hooks are Claude-only and will be ignored.`,
+      `Warning: Node '${node.id}' has hooks set but uses ${providerLabel} provider — hooks are Claude-only and will be ignored.`,
       { workflowId: workflowRunId, nodeName: node.id }
     );
     if (!delivered) {
@@ -418,13 +429,15 @@ async function resolveNodeProviderAndModel(
     }
   }
 
-  // Warn if Codex node has mcp (unsupported per-call)
-  if (provider === 'codex' && node.mcp) {
-    getLog().warn({ nodeId: node.id }, 'dag.mcp_ignored_codex');
+  // Warn if Codex/opencode node has mcp (unsupported per-call)
+  if ((provider === 'codex' || provider === 'opencode') && node.mcp) {
+    const logTag = provider === 'codex' ? 'dag.mcp_ignored_codex' : 'dag.mcp_ignored_opencode';
+    getLog().warn({ nodeId: node.id }, logTag);
+    const providerLabel = provider === 'codex' ? 'Codex' : 'opencode';
     const delivered = await safeSendMessage(
       platform,
       conversationId,
-      `Warning: Node '${node.id}' has mcp config but uses Codex — per-node MCP servers are not supported for Codex. Configure MCP servers globally in the Codex CLI config instead.`,
+      `Warning: Node '${node.id}' has mcp config but uses ${providerLabel} — per-node MCP servers are not supported for ${providerLabel}.${provider === 'codex' ? ' Configure MCP servers globally in the Codex CLI config instead.' : ''}`,
       { workflowId: workflowRunId, nodeName: node.id }
     );
     if (!delivered) {
@@ -432,13 +445,16 @@ async function resolveNodeProviderAndModel(
     }
   }
 
-  // Warn if Codex node has skills (unsupported)
-  if (provider === 'codex' && node.skills) {
-    getLog().warn({ nodeId: node.id }, 'dag.skills_ignored_codex');
+  // Warn if Codex/opencode node has skills (unsupported)
+  if ((provider === 'codex' || provider === 'opencode') && node.skills) {
+    const logTag =
+      provider === 'codex' ? 'dag.skills_ignored_codex' : 'dag.skills_ignored_opencode';
+    getLog().warn({ nodeId: node.id }, logTag);
+    const providerLabel = provider === 'codex' ? 'Codex' : 'opencode';
     const delivered = await safeSendMessage(
       platform,
       conversationId,
-      `Warning: Node '${node.id}' has skills set but uses Codex — per-node skills are not supported for Codex.`,
+      `Warning: Node '${node.id}' has skills set but uses ${providerLabel} — per-node skills are not supported for ${providerLabel}.`,
       { workflowId: workflowRunId, nodeName: node.id }
     );
     if (!delivered) {
@@ -446,8 +462,8 @@ async function resolveNodeProviderAndModel(
     }
   }
 
-  // Warn if Codex node has Claude-only SDK options (effort, thinking, maxBudgetUsd, systemPrompt, fallbackModel, betas, sandbox)
-  if (provider === 'codex') {
+  // Warn if Codex/opencode node has Claude-only SDK options (effort, thinking, maxBudgetUsd, systemPrompt, fallbackModel, betas, sandbox)
+  if (provider === 'codex' || provider === 'opencode') {
     const claudeOnlyFields = [
       ['effort', node.effort ?? workflowLevelOptions.effort],
       ['thinking', node.thinking ?? workflowLevelOptions.thinking],
@@ -459,11 +475,16 @@ async function resolveNodeProviderAndModel(
     ] as const;
     const present = claudeOnlyFields.filter(([, val]) => val !== undefined).map(([name]) => name);
     if (present.length > 0) {
-      getLog().warn({ nodeId: node.id, fields: present }, 'dag.claude_options_ignored_codex');
+      const logTag =
+        provider === 'codex'
+          ? 'dag.claude_options_ignored_codex'
+          : 'dag.claude_options_ignored_opencode';
+      getLog().warn({ nodeId: node.id, fields: present }, logTag);
+      const providerLabel = provider === 'codex' ? 'Codex' : 'opencode';
       const delivered = await safeSendMessage(
         platform,
         conversationId,
-        `Warning: Node '${node.id}' has Claude-only options (${present.join(', ')}) but uses Codex — these will be ignored.`,
+        `Warning: Node '${node.id}' has Claude-only options (${present.join(', ')}) but uses ${providerLabel} — these will be ignored.`,
         { workflowId: workflowRunId, nodeName: node.id }
       );
       if (!delivered) {
@@ -483,6 +504,11 @@ async function resolveNodeProviderAndModel(
       webSearchMode: config.assistants.codex.webSearchMode,
       additionalDirectories: config.assistants.codex.additionalDirectories,
     };
+    if (node.output_format) {
+      options.outputFormat = { type: 'json_schema', schema: node.output_format };
+    }
+  } else if (provider === 'opencode') {
+    options = { model };
     if (node.output_format) {
       options.outputFormat = { type: 'json_schema', schema: node.output_format };
     }
@@ -706,7 +732,7 @@ async function executeNodeInternal(
   cwd: string,
   workflowRun: WorkflowRun,
   node: CommandNode | PromptNode,
-  provider: 'claude' | 'codex',
+  provider: 'claude' | 'codex' | 'opencode',
   nodeOptions: WorkflowAssistantOptions | undefined,
   artifactsDir: string,
   logDir: string,
@@ -1442,7 +1468,7 @@ async function executeBashNode(
  * Caller is responsible for resolving per-node overrides before passing model.
  */
 function buildLoopNodeOptions(
-  provider: 'claude' | 'codex',
+  provider: 'claude' | 'codex' | 'opencode',
   model: string | undefined,
   config: WorkflowConfig
 ): WorkflowAssistantOptions | undefined {
@@ -1479,7 +1505,7 @@ async function executeLoopNode(
   cwd: string,
   workflowRun: WorkflowRun,
   node: LoopNode,
-  workflowProvider: 'claude' | 'codex',
+  workflowProvider: 'claude' | 'codex' | 'opencode',
   workflowModel: string | undefined,
   artifactsDir: string,
   logDir: string,
@@ -1967,7 +1993,7 @@ async function executeApprovalNode(
   deps: WorkflowDeps,
   platform: IWorkflowPlatform,
   conversationId: string,
-  workflowProvider: 'claude' | 'codex',
+  workflowProvider: 'claude' | 'codex' | 'opencode',
   workflowModel: string | undefined,
   cwd: string,
   artifactsDir: string,
@@ -2137,7 +2163,7 @@ export async function executeDagWorkflow(
   cwd: string,
   workflow: { name: string; nodes: readonly DagNode[] } & WorkflowLevelOptions,
   workflowRun: WorkflowRun,
-  workflowProvider: 'claude' | 'codex',
+  workflowProvider: 'claude' | 'codex' | 'opencode',
   workflowModel: string | undefined,
   artifactsDir: string,
   logDir: string,
@@ -2374,7 +2400,7 @@ export async function executeDagWorkflow(
           // 3b. Loop node dispatch — manages its own AI sessions and iteration
           if (isLoopNode(node)) {
             // Resolve per-node provider/model overrides (same logic as other node types)
-            let loopProvider: 'claude' | 'codex';
+            let loopProvider: 'claude' | 'codex' | 'opencode';
             if (node.provider) {
               loopProvider = node.provider;
             } else if (node.model && isClaudeModel(node.model)) {
