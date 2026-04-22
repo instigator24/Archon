@@ -43,6 +43,7 @@ const mockSetFlagValue = mock((_name: string, _value: boolean | string) => undef
 const mockExtensionRunner = {
   setFlagValue: mockSetFlagValue,
 };
+const mockSetModel = mock(async (_model: unknown) => undefined);
 const mockSession = {
   subscribe: mockSubscribe,
   prompt: mockPrompt,
@@ -50,6 +51,7 @@ const mockSession = {
   dispose: mockDispose,
   bindExtensions: mockBindExtensions,
   extensionRunner: mockExtensionRunner,
+  setModel: mockSetModel,
   isStreaming: false,
   sessionId: 'mock-session-uuid',
 };
@@ -81,7 +83,8 @@ const mockAuthCreate = mock(() => ({
   setRuntimeApiKey: mockSetRuntimeApiKey,
   getApiKey: mockGetApiKey,
 }));
-const mockModelRegistryInMemory = mock(() => ({}));
+const mockModelRegistryFind = mock((_provider: string, _modelId: string) => undefined);
+const mockModelRegistryInMemory = mock(() => ({ find: mockModelRegistryFind }));
 
 // SessionManager mocks. Each returns a tagged session-manager stub so tests
 // can assert whether resume resolved to an existing session or fell through
@@ -174,6 +177,7 @@ describe('PiProvider', () => {
     mockDispose.mockClear();
     mockSubscribe.mockClear();
     mockBindExtensions.mockClear();
+    mockSetModel.mockClear();
     mockSetFlagValue.mockClear();
     mockResourceLoaderReload.mockClear();
     mockCreateAgentSession.mockClear();
@@ -181,6 +185,7 @@ describe('PiProvider', () => {
     mockAuthCreate.mockClear();
     mockSetRuntimeApiKey.mockClear();
     mockGetApiKey.mockClear();
+    mockModelRegistryFind.mockClear();
     MockDefaultResourceLoader.mockClear();
     mockCreateReadTool.mockClear();
     mockCreateBashTool.mockClear();
@@ -281,11 +286,8 @@ describe('PiProvider', () => {
   });
 
   test('throws when getModel returns undefined', async () => {
-    process.env.GEMINI_API_KEY = 'sk-test';
-    // 'nonexistent' is handled in mockGetModel to return undefined, but
-    // the adapter rejects unknown providers before getModel. To exercise
-    // the not-found branch, use a known provider but unknown modelId by
-    // temporarily swapping mockGetModel to always return undefined.
+    // When static catalog misses and modelRegistry.find() also returns
+    // undefined (default mock), the provider throws after bindExtensions.
     mockGetModel.mockImplementationOnce(() => undefined);
     const { error } = await consume(
       new PiProvider().sendQuery('hi', '/tmp', undefined, {

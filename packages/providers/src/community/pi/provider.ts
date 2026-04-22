@@ -178,37 +178,9 @@ export class PiProvider implements IAgentProvider {
       );
     }
 
-    // 2. Look up the Model via Pi's static catalog. `lookupPiModel` returns
-    //    undefined when not found; we guard explicitly below.
-    // Cast to the runtime-string-friendly shape — see `lookupPiModel`'s docblock.
-    const model = lookupPiModel(piAi.getModel as GetModelFn, parsed.provider, parsed.modelId);
-    if (!model) {
-      throw new Error(
-        `Pi model not found: provider='${parsed.provider}' model='${parsed.modelId}'. ` +
-          'See https://github.com/badlogic/pi-mono/blob/main/packages/ai/src/models.generated.ts for the Pi model catalog.'
-      );
-    }
-
-    // 3. Build AuthStorage. `AuthStorage.create()` reads ~/.pi/agent/auth.json
-    //    (or $PI_CODING_AGENT_DIR/auth.json), so any credential the user has
-    //    populated via `pi` → `/login` (OAuth subscriptions: Claude Pro/Max,
-    //    ChatGPT Plus, GitHub Copilot, Gemini CLI, Antigravity) or by editing
-    //    the file directly (api_key entries) is picked up transparently.
-    //
-    //    Per-request env vars override the file via setRuntimeApiKey — this
-    //    mirrors Claude's process-env + request-env merge pattern and
-    //    ensures codebase-scoped env vars (from .archon/config.yaml `env:`)
-    //    win over the user's global Pi login.
-    //
-    //    Pi's internal resolution order:
-    //      1. runtime override  (our setRuntimeApiKey below)
-    //      2. auth.json api_key entry
-    //      3. auth.json oauth entry  (auto-refreshes expired tokens)
-    //      4. env var fallback  (Pi's getEnvApiKey, e.g. ANTHROPIC_API_KEY)
-    //
-    //    OAuth refresh note: Pi refreshes expired access tokens against the
-    //    provider's OAuth server and rewrites ~/.pi/agent/auth.json under a
-    //    file lock (same mechanism pi CLI uses — safe for concurrent access).
+    // 2. Build AuthStorage early — needed by ModelRegistry for extension-
+    //    registered providers. Reads ~/.pi/agent/auth.json; per-request env
+    //    vars override via setRuntimeApiKey (mirrors Claude's merge pattern).
     const authStorage = piCodingAgent.AuthStorage.create();
 
     const envVarName = PI_PROVIDER_ENV_VARS[parsed.provider];
@@ -219,32 +191,41 @@ export class PiProvider implements IAgentProvider {
       authStorage.setRuntimeApiKey(parsed.provider, envOverride);
     }
 
-    // Fail-fast: resolve creds synchronously before spinning up a session.
-    // Matches Claude's auth-error fast-fail pattern (no retry on auth failures).
-    const resolvedKey = await authStorage.getApiKey(parsed.provider);
-    if (!resolvedKey) {
-      const envHint = envVarName
-        ? `Set ${envVarName} in the environment or codebase env vars (.archon/config.yaml env: section).`
-        : `Provider '${parsed.provider}' is not in the Archon adapter's env-var table — file an issue if you want a shortcut env var for it.`;
-      const loginHint = `Or run \`pi\` and type \`/login\` locally to authenticate '${parsed.provider}' via OAuth; credentials land in ~/.pi/agent/auth.json and are picked up automatically.`;
-      throw new Error(
-        `Pi auth: no credentials for provider '${parsed.provider}'. ${envHint} ${loginHint}`
-      );
+    // 3. Model lookup — static catalog only. Extension-provided models
+    //    (e.g. kiro) register on the ModelRegistry during
+    //    session.bindExtensions(), so they're resolved after that call.
+    const modelRegistry = piCodingAgent.ModelRegistry.inMemory(authStorage);
+    const staticModel = lookupPiModel(piAi.getModel as GetModelFn, parsed.provider, parsed.modelId);
+
+    // 4. Auth fail-fast for built-in providers only. Extension-registered
+    //    providers (like kiro) manage their own credentials outside Pi's
+    //    AuthStorage, so we defer auth to them.
+    if (staticModel) {
+      const resolvedKey = await authStorage.getApiKey(parsed.provider);
+      if (!resolvedKey) {
+        const envHint = envVarName
+          ? `Set ${envVarName} in the environment or codebase env vars (.archon/config.yaml env: section).`
+          : `Provider '${parsed.provider}' is not in the Archon adapter's env-var table — file an issue if you want a shortcut env var for it.`;
+        const loginHint = `Or run \`pi\` and type \`/login\` locally to authenticate '${parsed.provider}' via OAuth; credentials land in ~/.pi/agent/auth.json and are picked up automatically.`;
+        throw new Error(
+          `Pi auth: no credentials for provider '${parsed.provider}'. ${envHint} ${loginHint}`
+        );
+      }
     }
 
-    // 4. Translate Archon nodeConfig to Pi SDK options. All three translations
+    // 5. Translate Archon nodeConfig to Pi SDK options. All three translations
     //    below correspond to capability flags declared `true` in
     //    PI_CAPABILITIES; nodeConfig fields that don't map cleanly still
     //    trigger a dag-executor warning upstream.
     const nodeConfig = requestOptions?.nodeConfig;
 
-    //    4a. thinkingLevel: covers `thinking`/`effort` nodeConfig fields.
+    //    5a. thinkingLevel: covers `thinking`/`effort` nodeConfig fields.
     const { level: thinkingLevel, warning: thinkingWarning } = resolvePiThinkingLevel(nodeConfig);
     if (thinkingWarning) {
       yield { type: 'system', content: `⚠️ ${thinkingWarning}` };
     }
 
-    //    4b. tools: covers allowed_tools / denied_tools. `undefined` leaves Pi
+    //    5b. tools: covers allowed_tools / denied_tools. `undefined` leaves Pi
     //        defaults; an explicit empty array means "no tools" (valid idiom
     //        matching e2e-claude-smoke's `allowed_tools: []`).
     //        requestOptions.env (codebase-scoped env vars from .archon/config.yaml)
@@ -262,11 +243,11 @@ export class PiProvider implements IAgentProvider {
       };
     }
 
-    //    4c. systemPrompt: request-level (AgentRequestOptions) wins over
+    //    5c. systemPrompt: request-level (AgentRequestOptions) wins over
     //        node-level; either overrides Pi's default.
     const systemPrompt = requestOptions?.systemPrompt ?? nodeConfig?.systemPrompt;
 
-    //    4d. skills: Archon uses name references (e.g. `skills: [agent-browser]`).
+    //    5d. skills: Archon uses name references (e.g. `skills: [agent-browser]`).
     //        Resolve each name against .agents/skills and .claude/skills (project
     //        + user-global). Resolved paths go through Pi's additionalSkillPaths;
     //        Pi's buildSystemPrompt appends their agentskills.io XML block to
@@ -279,7 +260,7 @@ export class PiProvider implements IAgentProvider {
       };
     }
 
-    // 5. Session management. Pi stores each session as a JSONL file under
+    // 6. Session management. Pi stores each session as a JSONL file under
     //    ~/.pi/agent/sessions/<encoded-cwd>/<uuid>.jsonl. `resolvePiSession`
     //    returns a SessionManager bound to either a new session (no resume
     //    id) or an existing session (resume id matches a file); if the id
@@ -294,13 +275,10 @@ export class PiProvider implements IAgentProvider {
       };
     }
 
-    // ModelRegistry + settings stay in-memory — only sessions persist, to
-    // match Claude/Codex. Resource loader still suppresses filesystem
-    // discovery by default, except for explicitly-passed skill paths and —
-    // when piConfig.enableExtensions is true — Pi's community extension
-    // ecosystem (tools + lifecycle hooks from ~/.pi/agent/extensions/ and
-    // packages installed via `pi install npm:<pkg>`).
-    const modelRegistry = piCodingAgent.ModelRegistry.inMemory(authStorage);
+    // Settings stay in-memory — only sessions persist, to match Claude/Codex.
+    // Resource loader suppresses filesystem discovery by default, except for
+    // explicitly-passed skill paths and — when piConfig.enableExtensions is
+    // true — Pi's community extension ecosystem.
     const settingsManager = piCodingAgent.SettingsManager.inMemory();
     // Default ON: extensions (community packages like @plannotator/pi-extension
     // or your own local ones) are a core reason users run Pi. Opt out with
@@ -342,7 +320,7 @@ export class PiProvider implements IAgentProvider {
 
     const { session, modelFallbackMessage } = await createAgentSession({
       cwd,
-      model,
+      ...(staticModel ? { model: staticModel } : {}),
       authStorage,
       modelRegistry,
       sessionManager,
@@ -356,7 +334,7 @@ export class PiProvider implements IAgentProvider {
       yield { type: 'system', content: `⚠️ ${modelFallbackMessage}` };
     }
 
-    // 4e. Extension flag pass-through. Must happen before bindExtensions
+    // 5e. Extension flag pass-through. Must happen before bindExtensions
     //     below — extensions read flags inside their session_start handler.
     if (enableExtensions && piConfig.extensionFlags) {
       const runner = session.extensionRunner;
@@ -367,9 +345,13 @@ export class PiProvider implements IAgentProvider {
       }
     }
 
-    // 4f. Bind UI context (so ctx.hasUI is true and ctx.ui.notify() forwards
+    // 5f. Bind UI context (so ctx.hasUI is true and ctx.ui.notify() forwards
     //     into the chunk stream) or fire session_start with no UI. Must run
     //     after flag pass-through above.
+    //
+    //     bindExtensions also wires providerActions into the ExtensionRunner,
+    //     which is when extension providers (e.g. pi-provider-kiro) call
+    //     modelRegistry.registerProvider() to register their models.
     const uiBridge = interactive ? createArchonUIBridge() : undefined;
     if (uiBridge) {
       const uiContext = createArchonUIContext(uiBridge);
@@ -378,7 +360,22 @@ export class PiProvider implements IAgentProvider {
       await session.bindExtensions({});
     }
 
-    // 5. Structured output (best-effort). Pi has no SDK-level JSON schema
+    // 5g. Deferred model resolution for extension providers. After
+    //     bindExtensions(), extension providers have registered their models
+    //     on our modelRegistry instance. Resolve and switch to the target model.
+    if (!staticModel) {
+      const extensionModel = modelRegistry.find(parsed.provider, parsed.modelId);
+      if (!extensionModel) {
+        throw new Error(
+          `Pi model not found: provider='${parsed.provider}' model='${parsed.modelId}'. ` +
+            'Ensure the provider extension is installed (e.g. `pi install npm:<pkg>`) ' +
+            'with `enableExtensions: true` in .archon/config.yaml.'
+        );
+      }
+      await session.setModel(extensionModel);
+    }
+
+    // 7. Structured output (best-effort). Pi has no SDK-level JSON schema
     //    mode the way Claude and Codex do, so we implement it via prompt
     //    engineering: append the schema + "JSON only, no fences" instruction,
     //    and have the bridge parse the accumulated assistant text on
@@ -389,7 +386,7 @@ export class PiProvider implements IAgentProvider {
       ? augmentPromptForJsonSchema(prompt, outputFormat.schema)
       : prompt;
 
-    // 6. Bridge callback-based events to the async generator contract.
+    // 8. Bridge callback-based events to the async generator contract.
     //    bridgeSession owns dispose() and abort wiring. When `interactive`
     //    is on, it also binds/unbinds the UI stub's emitter so extension
     //    notifications land on the same queue as Pi events.
